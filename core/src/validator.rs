@@ -1530,6 +1530,7 @@ impl Validator {
         );
 
         let bam_shred_receiver_addresses: Arc<ArcSwap<ShredReceiverAddresses>> = Arc::default();
+        let shredstream_receiver_address = Arc::new(ArcSwap::from_pointee(None)); // set by BlockEngineStage
 
         let vote_tracker = Arc::<VoteTracker>::default();
 
@@ -1714,8 +1715,10 @@ impl Validator {
                 bls_connection_cache,
                 voting_service_test_override: config.voting_service_test_override.clone(),
             },
+            shredstream_receiver_address.clone(),
             config.shred_retransmit_receiver_addresses.clone(),
             bam_shred_receiver_addresses.clone(),
+            config.multicast_receiver_address.clone(),
         )
         .map_err(ValidatorError::Other)?;
 
@@ -1793,6 +1796,7 @@ impl Validator {
             config.block_engine_config.clone(),
             config.relayer_config.clone(),
             config.tip_manager_config.clone(),
+            shredstream_receiver_address,
             config.shred_receiver_addresses.clone(),
             bam_shred_receiver_addresses,
             config.multicast_receiver_address.clone(),
