@@ -1,7 +1,5 @@
 //! The `retransmit_stage` retransmits shreds between validators
 
-#[cfg(target_os = "linux")]
-use std::net::IpAddr;
 use {
     crate::{
         MAX_SHRED_RECEIVER_ADDRESSES, ShredReceiverAddresses,
@@ -19,7 +17,7 @@ use {
     rand::Rng,
     rayon::{ThreadPool, ThreadPoolBuilder, prelude::*},
     solana_clock::{NUM_CONSECUTIVE_LEADER_SLOTS, Slot},
-    solana_gossip::{cluster_info::ClusterInfo, contact_info::Protocol},
+    solana_gossip::cluster_info::ClusterInfo,
     solana_ledger::{
         leader_schedule_cache::LeaderScheduleCache,
         shred::{self, ShredFlags, ShredId, ShredType},
@@ -422,23 +420,11 @@ fn retransmit(
                                 .is_some_and(|leader| leader.id == my_pubkey)
                     })
                 });
-            let forward_multicast_to_root = multicast_receiver_address_local.is_some()
-                && leader_tvu_allows_multicast(
-                    cluster_info
-                        .lookup_contact_info(&slot_leader.id, |node| node.tvu(Protocol::UDP))
-                        .flatten(),
-                    leader_tvu_has_direct_route,
-                );
             let cluster_nodes =
                 cluster_nodes_cache.get(slot, &root_bank, &working_bank, cluster_info);
             Some((
                 slot,
-                (
-                    slot_leader.id,
-                    cluster_nodes,
-                    include_bam_shred_receivers,
-                    forward_multicast_to_root,
-                ),
+                (slot_leader.id, cluster_nodes, include_bam_shred_receivers),
             ))
         })
         .collect();
@@ -517,7 +503,7 @@ fn retransmit(
 }
 
 // Retransmit a single shred to all downstream nodes
-#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+#[allow(clippy::too_many_arguments)]
 fn retransmit_shred(
     shred: shred::Payload,
     root_bank: &Bank,
@@ -528,7 +514,6 @@ fn retransmit_shred(
             /*leader:*/ Pubkey,
             Arc<ClusterNodes<RetransmitStage>>,
             /*include_bam_shred_receivers:*/ bool,
-            /*forward_multicast_to_root:*/ bool,
         ),
     >,
     addr_cache: &AddrCache,
@@ -549,7 +534,7 @@ fn retransmit_shred(
         return None;
     }
     let mut compute_turbine_peers = Measure::start("turbine_start");
-    let (root_distance, addrs, include_bam_shred_receivers, forward_multicast_to_root) =
+    let (root_distance, addrs, include_bam_shred_receivers) =
         get_retransmit_addrs(&key, cache, addr_cache, socket_addr_space, stats)?;
     compute_turbine_peers.stop();
     stats
@@ -565,7 +550,6 @@ fn retransmit_shred(
             turbine_addrs.push(*addr);
         }
     }
-    let is_root = root_distance == 0;
     let num_shred_receiver_addresses = shred_receiver_addresses
         .len()
         .min(MAX_SHRED_RECEIVER_ADDRESSES);
@@ -576,11 +560,11 @@ fn retransmit_shred(
             0
         });
     let mut external_addrs = ShredReceiverAddresses::with_capacity(external_addr_capacity);
-    let mut add_external_addr = |addr| {
-        if !turbine_addrs.contains(&addr) && !external_addrs.contains(&addr) {
-            external_addrs.push(addr);
-        }
-    };
+    let root_external_addrs = (root_distance == 0)
+        .then_some([shredstream_receiver_address, multicast_receiver_address])
+        .into_iter()
+        .flatten()
+        .flatten();
     for &addr in shred_receiver_addresses
         .iter()
         .take(num_shred_receiver_addresses)
@@ -590,15 +574,10 @@ fn retransmit_shred(
                 .into_iter()
                 .flatten(),
         )
+        .chain(root_external_addrs)
     {
-        add_external_addr(addr);
-    }
-    if is_root {
-        if let Some(&addr) = shredstream_receiver_address.as_ref() {
-            add_external_addr(addr);
-        }
-        if forward_multicast_to_root && let Some(&addr) = multicast_receiver_address.as_ref() {
-            add_external_addr(addr);
+        if !turbine_addrs.contains(&addr) && !external_addrs.contains(&addr) {
+            external_addrs.push(addr);
         }
     }
     let num_addrs = turbine_addrs.len();
@@ -672,7 +651,6 @@ fn retransmit_shred(
     })
 }
 
-#[allow(clippy::type_complexity)]
 fn get_retransmit_addrs<'a>(
     shred: &ShredId,
     cache: &HashMap<
@@ -681,7 +659,6 @@ fn get_retransmit_addrs<'a>(
             /*leader:*/ Pubkey,
             Arc<ClusterNodes<RetransmitStage>>,
             /*include_bam_shred_receivers:*/ bool,
-            /*forward_multicast_to_root:*/ bool,
         ),
     >,
     addr_cache: &'a AddrCache,
@@ -691,11 +668,10 @@ fn get_retransmit_addrs<'a>(
     /*root_distance:*/ u8,
     Cow<'a, [SocketAddr]>,
     /*include_bam_shred_receivers:*/ bool,
-    /*forward_multicast_to_root:*/ bool,
 )> {
     let cache_entry = cache.get(&shred.slot());
-    let (include_bam_shred_receivers, forward_multicast_to_root) = cache_entry
-        .map(|entry| (entry.2, entry.3))
+    let include_bam_shred_receivers = cache_entry
+        .map(|(_, _, include_bam_shred_receivers)| *include_bam_shred_receivers)
         .unwrap_or_default();
     if let Some((root_distance, addrs)) = addr_cache.get(shred) {
         stats.addr_cache_hit.fetch_add(1, Ordering::Relaxed);
@@ -703,10 +679,9 @@ fn get_retransmit_addrs<'a>(
             root_distance,
             Cow::Borrowed(addrs),
             include_bam_shred_receivers,
-            forward_multicast_to_root,
         ));
     }
-    let (slot_leader, cluster_nodes, _, _) = cache_entry?;
+    let (slot_leader, cluster_nodes, _) = cache_entry?;
     let (root_distance, addrs) = cluster_nodes
         .get_retransmit_addrs(slot_leader, shred, DATA_PLANE_FANOUT, socket_addr_space)
         .inspect_err(|err| match err {
@@ -720,64 +695,7 @@ fn get_retransmit_addrs<'a>(
         root_distance,
         Cow::Owned(addrs),
         include_bam_shred_receivers,
-        forward_multicast_to_root,
     ))
-}
-
-fn leader_tvu_allows_multicast(
-    leader_tvu_udp: Option<SocketAddr>,
-    leader_tvu_has_direct_route: impl Fn(SocketAddr) -> Option<bool>,
-) -> bool {
-    leader_tvu_udp.and_then(leader_tvu_has_direct_route) == Some(false)
-}
-
-#[cfg(target_os = "linux")]
-fn leader_tvu_has_direct_route(leader_tvu_udp: SocketAddr) -> Option<bool> {
-    use agave_xdp::netlink::netlink_get_routes;
-
-    const AF_INET: u8 = 2;
-    const AF_INET6: u8 = 10;
-    const RTNH_F_ONLINK: u32 = 4;
-
-    let ip = leader_tvu_udp.ip();
-    let family = match ip {
-        IpAddr::V4(_) => AF_INET,
-        IpAddr::V6(_) => AF_INET6,
-    };
-    let routes = netlink_get_routes(family).ok()?;
-    routes
-        .iter()
-        .filter(|route| route.family == family)
-        .filter(|route| route_matches_ip(route.destination, route.dst_len, ip))
-        .max_by_key(|route| route.dst_len)
-        .map(|route| route.gateway.is_none() || route.flags & RTNH_F_ONLINK != 0)
-}
-
-#[cfg(not(target_os = "linux"))]
-fn leader_tvu_has_direct_route(_leader_tvu_udp: SocketAddr) -> Option<bool> {
-    None
-}
-
-#[cfg(target_os = "linux")]
-fn route_matches_ip(destination: Option<IpAddr>, prefix_len: u8, ip: IpAddr) -> bool {
-    match (destination, ip) {
-        (None, _) => true,
-        (Some(IpAddr::V4(network)), IpAddr::V4(ip)) => {
-            let prefix_len = prefix_len.min(32);
-            let mask = u32::MAX
-                .checked_shl(32 - u32::from(prefix_len))
-                .unwrap_or(0);
-            (u32::from(network) & mask) == (u32::from(ip) & mask)
-        }
-        (Some(IpAddr::V6(network)), IpAddr::V6(ip)) => {
-            let prefix_len = prefix_len.min(128);
-            let mask = u128::MAX
-                .checked_shl(128 - u32::from(prefix_len))
-                .unwrap_or(0);
-            (u128::from(network) & mask) == (u128::from(ip) & mask)
-        }
-        _ => false,
-    }
 }
 
 // Speculatively precomputes turbine tree and caches retranmsit addresses.
@@ -1184,36 +1102,36 @@ mod tests {
             .unwrap()
     }
 
-    fn bind_receiver() -> UdpSocket {
-        let socket = bind_to_localhost_unique().unwrap();
-        socket
-            .set_read_timeout(Some(Duration::from_millis(200)))
-            .unwrap();
-        socket
-    }
+    #[test]
+    fn test_retransmit_external_receivers_are_deduped_and_bam_gated() {
+        let bind_receiver = || {
+            let socket = bind_to_localhost_unique().unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_millis(200)))
+                .unwrap();
+            socket
+        };
+        let recv_one = |socket: &UdpSocket| {
+            let mut buf = [0u8; 2048];
+            socket.recv_from(&mut buf).is_ok()
+        };
+        let assert_no_packet = |socket: &UdpSocket| {
+            let mut buf = [0u8; 2048];
+            assert!(socket.recv_from(&mut buf).is_err());
+        };
 
-    fn recv_one(socket: &UdpSocket) -> bool {
-        let mut buf = [0u8; 2048];
-        socket.recv_from(&mut buf).is_ok()
-    }
+        let turbine_receiver = bind_receiver();
+        let duplicate_configured_receiver = bind_receiver();
+        let configured_receiver = bind_receiver();
+        let bam_receiver = bind_receiver();
+        let turbine_addr = turbine_receiver.local_addr().unwrap();
+        let duplicate_configured_addr = duplicate_configured_receiver.local_addr().unwrap();
+        let configured_addr = configured_receiver.local_addr().unwrap();
+        let bam_addr = bam_receiver.local_addr().unwrap();
+        let retransmit_socket = bind_to_localhost_unique().unwrap();
+        let external_sender_socket = bind_to_localhost_unique().unwrap();
 
-    fn assert_no_packet(socket: &UdpSocket) {
-        let mut buf = [0u8; 2048];
-        assert!(socket.recv_from(&mut buf).is_err());
-    }
-
-    fn assert_one_packet(socket: &UdpSocket) {
-        assert!(recv_one(socket));
-        assert_no_packet(socket);
-    }
-
-    fn make_retransmit_test_context() -> (
-        shred::Payload,
-        ShredId,
-        Bank,
-        Arc<ClusterNodes<RetransmitStage>>,
-    ) {
-        let keypair = Arc::new(get_keypair());
+        let keypair = get_keypair();
         let entries = create_ticks(1, 1, Hash::new_unique());
         let shredder = Shredder::new(5, 4, 1, 0).unwrap();
         let (data_shreds, _) = shredder.entries_to_merkle_shreds_for_tests(
@@ -1228,11 +1146,12 @@ mod tests {
         );
         let shred = data_shreds[0].payload().clone();
         let key = shred::layout::get_shred_id(shred.as_ref()).unwrap();
+
         let genesis_config = create_genesis_config(10_000).genesis_config;
         let root_bank = Bank::new_for_tests(&genesis_config);
         let cluster_info = ClusterInfo::new(
             Node::new_localhost_with_pubkey(&keypair.pubkey()).info,
-            keypair,
+            Arc::new(keypair),
             SocketAddrSpace::Unspecified,
         );
         let cluster_nodes = Arc::new(crate::cluster_nodes::new_cluster_nodes::<RetransmitStage>(
@@ -1241,72 +1160,6 @@ mod tests {
             &HashMap::new(),
             false,
         ));
-        (shred, key, root_bank, cluster_nodes)
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn retransmit_test_shred(
-        shred: shred::Payload,
-        key: ShredId,
-        root_bank: &Bank,
-        cluster_nodes: Arc<ClusterNodes<RetransmitStage>>,
-        retransmit_socket: &UdpSocket,
-        external_sender_socket: &UdpSocket,
-        root_distance: u8,
-        turbine_addrs: Vec<SocketAddr>,
-        include_bam_shred_receivers: bool,
-        forward_multicast_to_root: bool,
-        shred_receiver_addresses: &ShredReceiverAddresses,
-        bam_shred_receiver_addresses: &ShredReceiverAddresses,
-        shredstream_receiver_address: &Option<SocketAddr>,
-        multicast_receiver_address: &Option<SocketAddr>,
-    ) -> RetransmitShredOutput {
-        let mut cache = HashMap::new();
-        cache.insert(
-            key.slot(),
-            (
-                Pubkey::new_unique(),
-                cluster_nodes,
-                include_bam_shred_receivers,
-                forward_multicast_to_root,
-            ),
-        );
-        let mut addr_cache = AddrCache::with_capacity(1);
-        addr_cache.put(&key, (root_distance, turbine_addrs.into_boxed_slice()));
-        let mut rng = ChaChaRng::from_seed([0xa5; 32]);
-        let shred_deduper = ShredDeduper::<2>::new(&mut rng, /*num_bits:*/ 640_007);
-        retransmit_shred(
-            shred,
-            root_bank,
-            &shred_deduper,
-            &cache,
-            &addr_cache,
-            &SocketAddrSpace::Unspecified,
-            RetransmitSocket::Socket(retransmit_socket),
-            external_sender_socket,
-            &RetransmitStats::new(Instant::now()),
-            shred_receiver_addresses,
-            bam_shred_receiver_addresses,
-            shredstream_receiver_address,
-            multicast_receiver_address,
-        )
-        .unwrap()
-    }
-
-    #[test]
-    fn test_retransmit_external_receivers_are_deduped_and_bam_gated() {
-        let turbine_receiver = bind_receiver();
-        let duplicate_configured_receiver = bind_receiver();
-        let configured_receiver = bind_receiver();
-        let bam_receiver = bind_receiver();
-        let turbine_addr = turbine_receiver.local_addr().unwrap();
-        let duplicate_configured_addr = duplicate_configured_receiver.local_addr().unwrap();
-        let configured_addr = configured_receiver.local_addr().unwrap();
-        let bam_addr = bam_receiver.local_addr().unwrap();
-        let retransmit_socket = bind_to_localhost_unique().unwrap();
-        let external_sender_socket = bind_to_localhost_unique().unwrap();
-
-        let (shred, key, root_bank, cluster_nodes) = make_retransmit_test_context();
         let shred_receiver_addresses: ShredReceiverAddresses =
             [duplicate_configured_addr, configured_addr]
                 .into_iter()
@@ -1317,22 +1170,38 @@ mod tests {
                 .collect();
 
         let retransmit_once = |include_bam_shred_receivers| {
-            retransmit_test_shred(
+            let mut cache = HashMap::new();
+            cache.insert(
+                key.slot(),
+                (
+                    Pubkey::new_unique(),
+                    cluster_nodes.clone(),
+                    include_bam_shred_receivers,
+                ),
+            );
+            let mut addr_cache = AddrCache::with_capacity(1);
+            addr_cache.put(
+                &key,
+                (0, Box::new([turbine_addr, duplicate_configured_addr])),
+            );
+            let mut rng = ChaChaRng::from_seed([0xa5; 32]);
+            let shred_deduper = ShredDeduper::<2>::new(&mut rng, /*num_bits:*/ 640_007);
+            retransmit_shred(
                 shred.clone(),
-                key,
                 &root_bank,
-                cluster_nodes.clone(),
-                &retransmit_socket,
+                &shred_deduper,
+                &cache,
+                &addr_cache,
+                &SocketAddrSpace::Unspecified,
+                RetransmitSocket::Socket(&retransmit_socket),
                 &external_sender_socket,
-                0,
-                vec![turbine_addr, duplicate_configured_addr],
-                include_bam_shred_receivers,
-                false,
+                &RetransmitStats::new(Instant::now()),
                 &shred_receiver_addresses,
                 &bam_shred_receiver_addresses,
                 &None,
                 &None,
             )
+            .unwrap()
         };
 
         let out = retransmit_once(false);
@@ -1355,146 +1224,6 @@ mod tests {
         assert_no_packet(&duplicate_configured_receiver);
         assert_no_packet(&configured_receiver);
         assert_no_packet(&bam_receiver);
-
-        let shredstream_addr = Some(turbine_addr);
-        let multicast_addr = Some(configured_addr);
-        let out = retransmit_test_shred(
-            shred.clone(),
-            key,
-            &root_bank,
-            cluster_nodes,
-            &retransmit_socket,
-            &external_sender_socket,
-            0,
-            vec![turbine_addr],
-            true,
-            true,
-            &shred_receiver_addresses,
-            &bam_shred_receiver_addresses,
-            &shredstream_addr,
-            &multicast_addr,
-        );
-        assert_eq!(out.num_nodes, 1);
-        assert_one_packet(&turbine_receiver);
-        assert_one_packet(&duplicate_configured_receiver);
-        assert_one_packet(&configured_receiver);
-        assert_one_packet(&bam_receiver);
-    }
-
-    #[test]
-    fn test_retransmit_root_only_shredstream_and_multicast_forwarding() {
-        let turbine_receiver = bind_receiver();
-        let shredstream_receiver = bind_receiver();
-        let multicast_receiver = bind_receiver();
-        let turbine_addr = turbine_receiver.local_addr().unwrap();
-        let shredstream_addr = Some(shredstream_receiver.local_addr().unwrap());
-        let multicast_addr = Some(multicast_receiver.local_addr().unwrap());
-        let retransmit_socket = bind_to_localhost_unique().unwrap();
-        let external_sender_socket = bind_to_localhost_unique().unwrap();
-        let (shred, key, root_bank, cluster_nodes) = make_retransmit_test_context();
-        let empty = ShredReceiverAddresses::new();
-
-        let out = retransmit_test_shred(
-            shred.clone(),
-            key,
-            &root_bank,
-            cluster_nodes.clone(),
-            &retransmit_socket,
-            &external_sender_socket,
-            0,
-            vec![turbine_addr],
-            false,
-            true,
-            &empty,
-            &empty,
-            &shredstream_addr,
-            &multicast_addr,
-        );
-        assert_eq!(out.root_distance, 0);
-        assert_one_packet(&turbine_receiver);
-        assert_one_packet(&shredstream_receiver);
-        assert_one_packet(&multicast_receiver);
-
-        let out = retransmit_test_shred(
-            shred.clone(),
-            key,
-            &root_bank,
-            cluster_nodes.clone(),
-            &retransmit_socket,
-            &external_sender_socket,
-            1,
-            vec![turbine_addr],
-            false,
-            true,
-            &empty,
-            &empty,
-            &shredstream_addr,
-            &multicast_addr,
-        );
-        assert_eq!(out.root_distance, 1);
-        assert_one_packet(&turbine_receiver);
-        assert_no_packet(&shredstream_receiver);
-        assert_no_packet(&multicast_receiver);
-
-        let out = retransmit_test_shred(
-            shred,
-            key,
-            &root_bank,
-            cluster_nodes,
-            &retransmit_socket,
-            &external_sender_socket,
-            0,
-            vec![turbine_addr],
-            false,
-            false,
-            &empty,
-            &empty,
-            &shredstream_addr,
-            &multicast_addr,
-        );
-        assert_eq!(out.root_distance, 0);
-        assert_one_packet(&turbine_receiver);
-        assert_one_packet(&shredstream_receiver);
-        assert_no_packet(&multicast_receiver);
-    }
-
-    #[test]
-    fn test_leader_tvu_allows_multicast_requires_non_direct_route() {
-        let leader_tvu_addr = Some("10.0.0.1:8001".parse().unwrap());
-
-        for (leader_tvu_addr, route_lookup_result, expected) in [
-            (leader_tvu_addr, Some(false), true),
-            (leader_tvu_addr, Some(true), false),
-            (leader_tvu_addr, None, false),
-            (None, Some(false), false),
-        ] {
-            assert_eq!(
-                leader_tvu_allows_multicast(leader_tvu_addr, |_| route_lookup_result),
-                expected,
-            );
-        }
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn test_route_matches_ip() {
-        for (destination, prefix_len, ip, expected) in [
-            (Some("10.0.0.0".parse().unwrap()), 24, "10.0.0.1", true),
-            (Some("10.0.1.0".parse().unwrap()), 24, "10.0.0.1", false),
-            (Some("2001:db8::".parse().unwrap()), 32, "2001:db8::1", true),
-            (
-                Some("2001:db9::".parse().unwrap()),
-                32,
-                "2001:db8::1",
-                false,
-            ),
-            (None, 0, "10.0.0.1", true),
-        ] {
-            assert_eq!(
-                route_matches_ip(destination, prefix_len, ip.parse().unwrap()),
-                expected,
-            );
-        }
     }
 
     #[test]
