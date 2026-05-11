@@ -1116,14 +1116,13 @@ mod tests {
                 .unwrap();
             socket
         };
+        let recv_one = |socket: &UdpSocket| {
+            let mut buf = [0u8; 2048];
+            socket.recv_from(&mut buf).is_ok()
+        };
         let assert_no_packet = |socket: &UdpSocket| {
             let mut buf = [0u8; 2048];
             assert!(socket.recv_from(&mut buf).is_err());
-        };
-        let assert_one_packet = |socket: &UdpSocket| {
-            let mut buf = [0u8; 2048];
-            assert!(socket.recv_from(&mut buf).is_ok());
-            assert_no_packet(socket);
         };
 
         let turbine_receiver = bind_receiver();
@@ -1223,42 +1222,61 @@ mod tests {
 
         let out = retransmit_once(false, 0, None, None);
         assert_eq!(out.num_nodes, 2);
-        assert_one_packet(&turbine_receiver);
-        assert_one_packet(&duplicate_configured_receiver);
-        assert_one_packet(&configured_receiver);
+        assert!(recv_one(&turbine_receiver));
+        assert!(recv_one(&duplicate_configured_receiver));
+        assert!(recv_one(&configured_receiver));
+        assert_no_packet(&turbine_receiver);
+        assert_no_packet(&duplicate_configured_receiver);
+        assert_no_packet(&configured_receiver);
         assert_no_packet(&bam_receiver);
 
         let out = retransmit_once(true, 0, None, None);
         assert_eq!(out.num_nodes, 2);
-        assert_one_packet(&turbine_receiver);
-        assert_one_packet(&duplicate_configured_receiver);
-        assert_one_packet(&configured_receiver);
-        assert_one_packet(&bam_receiver);
+        assert!(recv_one(&turbine_receiver));
+        assert!(recv_one(&duplicate_configured_receiver));
+        assert!(recv_one(&configured_receiver));
+        assert!(recv_one(&bam_receiver));
+        assert_no_packet(&turbine_receiver);
+        assert_no_packet(&duplicate_configured_receiver);
+        assert_no_packet(&configured_receiver);
+        assert_no_packet(&bam_receiver);
 
         let out = retransmit_once(false, 0, Some(shredstream_addr), Some(multicast_addr));
         assert_eq!(out.num_nodes, 2);
-        assert_one_packet(&turbine_receiver);
-        assert_one_packet(&duplicate_configured_receiver);
-        assert_one_packet(&configured_receiver);
-        assert_one_packet(&shredstream_receiver);
-        assert_one_packet(&multicast_receiver);
+        assert!(recv_one(&turbine_receiver));
+        assert!(recv_one(&duplicate_configured_receiver));
+        assert!(recv_one(&configured_receiver));
+        assert!(recv_one(&shredstream_receiver));
+        assert!(recv_one(&multicast_receiver));
+        assert_no_packet(&turbine_receiver);
+        assert_no_packet(&duplicate_configured_receiver);
+        assert_no_packet(&configured_receiver);
         assert_no_packet(&bam_receiver);
+        assert_no_packet(&shredstream_receiver);
+        assert_no_packet(&multicast_receiver);
 
         let out = retransmit_once(false, 1, Some(shredstream_addr), Some(multicast_addr));
         assert_eq!(out.num_nodes, 2);
-        assert_one_packet(&turbine_receiver);
-        assert_one_packet(&duplicate_configured_receiver);
-        assert_one_packet(&configured_receiver);
+        assert!(recv_one(&turbine_receiver));
+        assert!(recv_one(&duplicate_configured_receiver));
+        assert!(recv_one(&configured_receiver));
+        assert_no_packet(&turbine_receiver);
+        assert_no_packet(&duplicate_configured_receiver);
+        assert_no_packet(&configured_receiver);
         assert_no_packet(&bam_receiver);
         assert_no_packet(&shredstream_receiver);
         assert_no_packet(&multicast_receiver);
 
         let out = retransmit_once(true, 0, Some(turbine_addr), Some(configured_addr));
         assert_eq!(out.num_nodes, 2);
-        assert_one_packet(&turbine_receiver);
-        assert_one_packet(&duplicate_configured_receiver);
-        assert_one_packet(&configured_receiver);
-        assert_one_packet(&bam_receiver);
+        assert!(recv_one(&turbine_receiver));
+        assert!(recv_one(&duplicate_configured_receiver));
+        assert!(recv_one(&configured_receiver));
+        assert!(recv_one(&bam_receiver));
+        assert_no_packet(&turbine_receiver);
+        assert_no_packet(&duplicate_configured_receiver);
+        assert_no_packet(&configured_receiver);
+        assert_no_packet(&bam_receiver);
     }
 
     #[test]
